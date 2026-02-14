@@ -27,6 +27,7 @@ class StrategyParams:
     roll_spot_ratio: float = 0.98
     hard_defense_dte: int = 5
     hard_defense_spot_ratio: float = 0.99
+    dte_tolerance: int = 3
 
 
 @dataclass
@@ -450,6 +451,8 @@ def fetch_live_option_candidates(
     hv20 = float(feat_now["hv20"].iloc[-1])
     target_delta_live = dynamic_delta(params.target_delta, trend_score)
     trend_in_window = 1.0 if params.trend_min <= trend_score <= params.trend_max else 0.0
+    effective_dte_min = max(7, params.dte - params.dte_tolerance)
+    effective_dte_max = min(70, params.dte + params.dte_tolerance)
 
     expirations = tk.options
     if not expirations:
@@ -461,21 +464,22 @@ def fetch_live_option_candidates(
     for exp in expirations:
         exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
         dte = (exp_date - today).days
-        if dte < 7 or dte > 70:
+        if dte < effective_dte_min or dte > effective_dte_max:
             continue
 
         calls = tk.option_chain(exp).calls.copy()
         if calls.empty:
             continue
 
-        cols = ["strike", "lastPrice", "impliedVolatility", "volume", "openInterest", "delta"]
+        cols = ["strike", "bid", "ask", "lastPrice", "impliedVolatility", "volume", "openInterest", "delta"]
         for c in cols:
             if c not in calls.columns:
                 calls[c] = np.nan
 
         for _, row in calls.iterrows():
             strike = safe_float(row.get("strike"), np.nan)
-            premium = safe_float(row.get("lastPrice"), np.nan)
+            bid = safe_float(row.get("bid"), np.nan)
+            ask = safe_float(row.get("ask"), np.nan)
             iv = safe_float(row.get("impliedVolatility"), np.nan)
             delta_raw = safe_float(row.get("delta"), np.nan)
             volume = safe_float(row.get("volume"), 0.0)
@@ -483,8 +487,9 @@ def fetch_live_option_candidates(
 
             if np.isnan(strike) or strike <= spot:
                 continue
-            if np.isnan(premium) or premium <= 0:
+            if np.isnan(bid) or np.isnan(ask) or bid <= 0 or ask <= 0 or ask < bid:
                 continue
+            premium = 0.5 * (bid + ask)
 
             sigma = iv if not np.isnan(iv) and iv > 0 else max(hv20, 0.20)
             _, model_delta, itm_prob = bs_call_metrics(spot, strike, dte / 365.0, sigma)
@@ -522,7 +527,10 @@ def fetch_live_option_candidates(
             )
 
     if not candidates:
-        raise ValueError("当前没有满足约束的可卖Call；可放宽年化或行权概率上限。")
+        raise ValueError(
+            f"当前没有满足条件的可卖Call（DTE严格窗口: {effective_dte_min}-{effective_dte_max}天）。"
+            " 可放宽年化/行权概率上限，或等待更合适到期日。"
+        )
 
     candidates.sort(key=lambda x: x.score)
     best = candidates[0]
@@ -550,6 +558,8 @@ def fetch_live_option_candidates(
         "vol_rank": vol_rank,
         "hv20": hv20,
         "target_delta_live": target_delta_live,
+        "dte_window_min": float(effective_dte_min),
+        "dte_window_max": float(effective_dte_max),
         "trend_in_window": trend_in_window,
     }
     return best, top_df, spot, ctx
@@ -776,6 +786,69 @@ def make_strategy_explanation(summary: StrategySummary, target_cagr: float, max_
     return "\n".join([head] + details)
 
 
+def build_param_mapping_table(
+    params: StrategyParams,
+    shares: int,
+    recommendation: LiveOptionCandidate,
+    market_ctx: Dict[str, float],
+    next_earnings: Optional[date],
+) -> pd.DataFrame:
+    contracts = suggested_contracts(shares, float(market_ctx.get("vol_rank", 0.5)))
+    close_trigger_mark = max(recommendation.premium * (1.0 - params.take_profit_pct), 0.01)
+    soft_roll_spot = recommendation.strike * params.roll_spot_ratio
+    hard_roll_spot = recommendation.strike * params.hard_defense_spot_ratio
+
+    earnings_text = str(next_earnings) if next_earnings is not None else "未知"
+    dte_min = int(market_ctx.get("dte_window_min", max(7, params.dte - params.dte_tolerance)))
+    dte_max = int(market_ctx.get("dte_window_max", min(70, params.dte + params.dte_tolerance)))
+
+    rows = [
+        {
+            "策略参数": "target_delta + trend_score",
+            "当前市场输入": f"{params.target_delta:.2f} + {float(market_ctx.get('trend_score', 0.0)):.2f}",
+            "映射结果": f"实时目标Delta = {float(market_ctx.get('target_delta_live', 0.0)):.2f}",
+            "对应动作": f"优先匹配Delta接近 {float(market_ctx.get('target_delta_live', 0.0)):.2f} 的Call",
+        },
+        {
+            "策略参数": "dte",
+            "当前市场输入": f"{params.dte}天，容差±{params.dte_tolerance}天",
+            "映射结果": f"建议到期日 {recommendation.expiration}（{recommendation.dte}天）",
+            "对应动作": f"DTE严格窗口 {dte_min}-{dte_max} 天",
+        },
+        {
+            "策略参数": "vol_rank_min/max",
+            "当前市场输入": f"{params.vol_rank_min:.2f}-{params.vol_rank_max:.2f} vs 当前 {float(market_ctx.get('vol_rank', 0.0)):.2f}",
+            "映射结果": f"覆盖张数建议 {contracts} 张（{shares} 股）",
+            "对应动作": "按覆盖比例卖出，避免满仓覆盖",
+        },
+        {
+            "策略参数": "trend_min/max + earnings window",
+            "当前市场输入": f"趋势区间 {params.trend_min:.2f}-{params.trend_max:.2f}；财报 {earnings_text}",
+            "映射结果": "当前趋势条件满足" if market_ctx.get("trend_in_window", 0.0) >= 0.5 else "当前趋势条件不满足",
+            "对应动作": "趋势与财报窗口共同决定是否开仓",
+        },
+        {
+            "策略参数": "take_profit_pct",
+            "当前市场输入": f"{params.take_profit_pct:.0%}",
+            "映射结果": f"止盈平仓线 mark <= ${close_trigger_mark:.2f}",
+            "对应动作": "达到阈值即 Buy to Close",
+        },
+        {
+            "策略参数": "roll_delta + roll_spot_ratio",
+            "当前市场输入": f"Delta {params.roll_delta:.2f} / Spot比 {params.roll_spot_ratio:.2f}",
+            "映射结果": f"滚动线 Delta>= {params.roll_delta:.2f} 或 Spot>= ${soft_roll_spot:.2f}",
+            "对应动作": "触发即 Roll Up & Out",
+        },
+        {
+            "策略参数": "hard_defense_dte + hard_defense_spot_ratio",
+            "当前市场输入": f"DTE<= {params.hard_defense_dte} / Spot比 {params.hard_defense_spot_ratio:.2f}",
+            "映射结果": f"硬防守线 DTE<= {params.hard_defense_dte} 且 Spot>= ${hard_roll_spot:.2f}",
+            "对应动作": "当日平仓或滚动，不留到到期",
+        },
+    ]
+    return pd.DataFrame(rows)
+
+
 def render_app() -> None:
     st.set_page_config(page_title="TSLA Sell Call 策略程序", layout="wide")
     st.title("TSLA Sell Call 策略程序")
@@ -977,6 +1050,19 @@ def render_app() -> None:
         l2.metric("趋势分数", f"{float(live_ctx.get('trend_score', 0.0)):.2f}")
         l3.metric("波动率分位", f"{float(live_ctx.get('vol_rank', 0.0)):.2f}")
         l4.metric("实时目标Delta", f"{float(live_ctx.get('target_delta_live', 0.0)):.2f}")
+        st.caption(
+            f"DTE严格窗口: {int(live_ctx.get('dte_window_min', 0))}-{int(live_ctx.get('dte_window_max', 0))} 天；"
+            f"当前推荐偏差: {abs(int(live_best.dte) - int(best.params.dte))} 天。"
+        )
+        st.subheader("参数 -> 当前建议 映射表")
+        mapping_df = build_param_mapping_table(
+            params=best.params,
+            shares=shares,
+            recommendation=live_best,
+            market_ctx=live_ctx,
+            next_earnings=next_earnings,
+        )
+        st.dataframe(mapping_df, use_container_width=True)
 
         rec = {
             "Ticker": analysis["ticker"],
