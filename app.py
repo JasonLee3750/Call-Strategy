@@ -1,98 +1,208 @@
 import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from io import StringIO
 from typing import Dict, List, Optional, Tuple
 
+import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-import altair as alt
 from scipy.stats import norm
 
 TRADING_DAYS = 252
 
 
 @dataclass
-class StrategyConfig:
+class StrategyParams:
     target_delta: float
     dte: int
     vol_rank_min: float
     vol_rank_max: float
     trend_min: float
     trend_max: float
+    take_profit_pct: float = 0.70
+    roll_delta: float = 0.30
+    roll_spot_ratio: float = 0.98
+    hard_defense_dte: int = 5
+    hard_defense_spot_ratio: float = 0.99
 
 
 @dataclass
-class StrategyResult:
-    config: StrategyConfig
+class StrategySummary:
+    params: StrategyParams
     trades: int
+    cagr: float
+    annual_return: float
     assignment_rate: float
     win_rate: float
-    cagr: float
-    annualized_mean: float
     max_drawdown: float
     premium_yield_avg: float
     score: float
 
 
 @dataclass
-class LiveOption:
+class LiveOptionCandidate:
     expiration: str
     dte: int
     strike: float
     premium: float
     iv: float
+    delta: float
     assignment_prob: float
-    premium_yield_annualized: float
+    annualized_yield: float
     volume: float
     open_interest: float
     score: float
 
 
-def clamp(v: float, lo: float, hi: float) -> float:
-    return float(max(lo, min(hi, v)))
+@dataclass
+class PositionAdvice:
+    expiration: str
+    dte: int
+    strike: float
+    matched_strike: float
+    contracts: int
+    premium_collected: float
+    mark: float
+    delta: float
+    iv: float
+    spot: float
+    pnl_cash: float
+    pnl_pct: float
+    close_trigger_mark: float
+    action: str
+    reason: str
 
 
-def safe_float(v, default=np.nan) -> float:
+def clamp(x: float, lo: float, hi: float) -> float:
+    return float(max(lo, min(hi, x)))
+
+
+def safe_float(x, default=np.nan) -> float:
     try:
-        if v is None:
+        if x is None:
             return default
-        return float(v)
+        return float(x)
     except Exception:
         return default
 
 
-def bs_call_price_itm_prob_delta(
+def pct(x: float) -> str:
+    return f"{x * 100:.2f}%"
+
+
+def parse_date(v) -> Optional[date]:
+    try:
+        ts = pd.to_datetime(v, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts.date()
+    except Exception:
+        return None
+
+
+def bs_call_metrics(
     spot: float,
     strike: float,
     t_years: float,
     sigma: float,
     r: float = 0.03,
 ) -> Tuple[float, float, float]:
+    """Return (price, delta, ITM probability at expiry)."""
     if spot <= 0 or strike <= 0 or t_years <= 0:
         return 0.0, 1.0, 1.0
 
-    sigma = max(sigma, 1e-4)
-    d1 = (math.log(spot / strike) + (r + 0.5 * sigma**2) * t_years) / (sigma * math.sqrt(t_years))
-    d2 = d1 - sigma * math.sqrt(t_years)
+    sigma = max(float(sigma), 1e-4)
+    root_t = math.sqrt(t_years)
+    d1 = (math.log(spot / strike) + (r + 0.5 * sigma * sigma) * t_years) / (sigma * root_t)
+    d2 = d1 - sigma * root_t
+
     call = spot * norm.cdf(d1) - strike * math.exp(-r * t_years) * norm.cdf(d2)
-    itm_prob = norm.cdf(d2)
     delta = norm.cdf(d1)
-    return max(call, 0.0), float(np.clip(itm_prob, 0.0, 1.0)), float(np.clip(delta, 0.0, 1.0))
+    itm_prob = norm.cdf(d2)
+
+    return max(float(call), 0.0), clamp(float(delta), 0.0, 1.0), clamp(float(itm_prob), 0.0, 1.0)
 
 
-def load_price_history(ticker: str, years: int = 8) -> pd.Series:
-    start = (datetime.utcnow() - timedelta(days=years * 365 + 450)).strftime("%Y-%m-%d")
+def trend_label(score: float) -> str:
+    if score >= 0.60:
+        return "强上行"
+    if score >= 0.20:
+        return "温和上行"
+    if score <= -0.60:
+        return "强下行"
+    if score <= -0.20:
+        return "温和下行"
+    return "震荡"
+
+
+def dynamic_delta(target_delta: float, trend_score: float) -> float:
+    # 趋势越强（尤其上行），delta越保守（更远OTM）
+    return clamp(target_delta - 0.05 * trend_score, 0.05, 0.35)
+
+
+def suggested_contracts(total_shares: int, vol_rank_now: float) -> int:
+    max_contracts = max(total_shares // 100, 0)
+    if max_contracts == 0:
+        return 0
+    cover_ratio = 0.50 if vol_rank_now < 0.10 else 0.75
+    return max(1, min(max_contracts, int(math.floor(max_contracts * cover_ratio + 1e-9))))
+
+
+def get_next_earnings_date(ticker: str) -> Optional[date]:
     tk = yf.Ticker(ticker)
-    hist = tk.history(start=start, auto_adjust=True)
-    if hist.empty or len(hist) < 1000:
-        raise ValueError("历史数据不足，无法完成8年策略搜索。")
+    today = datetime.utcnow().date()
+    dates: List[date] = []
+
+    try:
+        edf = tk.get_earnings_dates(limit=12)
+        if isinstance(edf, pd.DataFrame) and not edf.empty:
+            for d in pd.to_datetime(edf.index, errors="coerce"):
+                if pd.isna(d):
+                    continue
+                dd = d.date()
+                if dd >= today:
+                    dates.append(dd)
+    except Exception:
+        pass
+
+    try:
+        cal = tk.calendar
+        if isinstance(cal, pd.DataFrame):
+            values = cal.values.flatten().tolist()
+        elif isinstance(cal, dict):
+            values = list(cal.values())
+        else:
+            values = []
+
+        for raw in values:
+            items = raw if isinstance(raw, (list, tuple, np.ndarray, pd.Series)) else [raw]
+            for item in items:
+                dd = parse_date(item)
+                if dd and dd >= today:
+                    dates.append(dd)
+    except Exception:
+        pass
+
+    if not dates:
+        return None
+    return min(dates)
+
+
+def load_close_history(ticker: str, years: int = 8) -> pd.Series:
+    start = (datetime.utcnow() - timedelta(days=years * 365 + 450)).strftime("%Y-%m-%d")
+    hist = yf.Ticker(ticker).history(start=start, auto_adjust=True)
+    if hist.empty or "Close" not in hist.columns:
+        raise ValueError("无法获取历史价格数据。")
     close = hist["Close"].dropna()
+    if len(close) < 1000:
+        raise ValueError("历史数据长度不足，无法稳定回测8年。")
     return close
 
 
-def compute_features(close: pd.Series) -> pd.DataFrame:
+def build_feature_frame(close: pd.Series) -> pd.DataFrame:
     ret = close.pct_change()
     hv20 = ret.rolling(20).std() * math.sqrt(TRADING_DAYS)
     hv60 = ret.rolling(60).std() * math.sqrt(TRADING_DAYS)
@@ -109,11 +219,12 @@ def compute_features(close: pd.Series) -> pd.DataFrame:
     ema60 = close.ewm(span=60, adjust=False).mean()
     trend = (ema20 / ema60) - 1.0
     mom63 = close.pct_change(63)
-    roll_max120 = close.rolling(120).max()
-    roll_min120 = close.rolling(120).min()
-    range_pos120 = (close - roll_min120) / (roll_max120 - roll_min120 + 1e-9)
 
-    trend_shape = (
+    max120 = close.rolling(120).max()
+    min120 = close.rolling(120).min()
+    range_pos120 = (close - min120) / (max120 - min120 + 1e-9)
+
+    trend_score = (
         0.45 * (trend / 0.10).clip(-1.5, 1.5)
         + 0.35 * (mom63 / 0.20).clip(-1.5, 1.5)
         + 0.20 * ((range_pos120 * 2.0 - 1.0).clip(-1.0, 1.0))
@@ -125,33 +236,16 @@ def compute_features(close: pd.Series) -> pd.DataFrame:
             "hv20": hv20,
             "hv60": hv60,
             "vol_rank": vol_rank,
+            "trend_score": trend_score,
             "trend": trend,
             "mom63": mom63,
             "range_pos120": range_pos120,
-            "trend_shape": trend_shape,
         }
     )
     return feat.dropna()
 
 
-def trend_label(v: float) -> str:
-    if v >= 0.6:
-        return "强上行"
-    if v >= 0.2:
-        return "温和上行"
-    if v <= -0.6:
-        return "强下行"
-    if v <= -0.2:
-        return "温和下行"
-    return "震荡"
-
-
-def adjusted_delta(base_delta: float, trend_shape_value: float) -> float:
-    # 上行趋势更强时，下调delta（更远OTM）以降低被行权风险。
-    return clamp(base_delta - 0.05 * trend_shape_value, 0.05, 0.35)
-
-
-def find_expiry(index: pd.DatetimeIndex, start_dt: pd.Timestamp, dte: int) -> Optional[pd.Timestamp]:
+def next_trade_date(index: pd.DatetimeIndex, start_dt: pd.Timestamp, dte: int) -> Optional[pd.Timestamp]:
     target = start_dt + pd.Timedelta(days=dte)
     pos = index.searchsorted(target)
     if pos >= len(index):
@@ -159,282 +253,289 @@ def find_expiry(index: pd.DatetimeIndex, start_dt: pd.Timestamp, dte: int) -> Op
     return index[pos]
 
 
-def simulate_short_call_leg(
-    feat: pd.DataFrame,
-    cfg: StrategyConfig,
-    years: int = 8,
-) -> Tuple[pd.DataFrame, StrategyResult]:
+def strike_from_delta(spot: float, delta_target: float, sigma: float, t_years: float, r: float = 0.03) -> float:
+    z = norm.ppf(clamp(delta_target, 0.02, 0.98))
+    ln_s_k = z * sigma * math.sqrt(t_years) - (r + 0.5 * sigma * sigma) * t_years
+    return float(spot / math.exp(ln_s_k))
+
+
+def backtest_single(feat: pd.DataFrame, params: StrategyParams, shares: int) -> Tuple[pd.DataFrame, StrategySummary]:
     close = feat["close"]
     idx = close.index
-    first = idx.min() + pd.Timedelta(days=365)
-    last = idx.max() - pd.Timedelta(days=cfg.dte + 3)
 
-    rebal_dates = close.loc[first:last].resample("MS").first().dropna().index
-    rows = []
+    start_date = idx.min() + pd.Timedelta(days=365)
+    end_date = idx.max() - pd.Timedelta(days=params.dte + 3)
+    rebalance_dates = close.loc[start_date:end_date].resample("MS").first().dropna().index
 
-    for dt in rebal_dates:
+    rows: List[Dict[str, object]] = []
+
+    for dt in rebalance_dates:
         if dt not in feat.index:
             continue
-        row = feat.loc[dt]
-        vr = float(row["vol_rank"])
-        tr = float(row["trend_shape"])
-        if vr < cfg.vol_rank_min or vr > cfg.vol_rank_max:
+
+        fr = feat.loc[dt]
+        vol_rank = float(fr["vol_rank"])
+        trend_score = float(fr["trend_score"])
+
+        if not (params.vol_rank_min <= vol_rank <= params.vol_rank_max):
             continue
-        if tr < cfg.trend_min or tr > cfg.trend_max:
+        if not (params.trend_min <= trend_score <= params.trend_max):
             continue
 
-        spot = float(row["close"])
-        sigma = float(max(row["hv20"], 0.08))
-        t_years = cfg.dte / 365.0
+        spot = float(fr["close"])
+        sigma = float(max(fr["hv20"], 0.08))
+        dte = int(params.dte)
+        t_years = dte / 365.0
 
-        eff_delta = adjusted_delta(cfg.target_delta, tr)
-        # 使用动态delta反推执行价（BSM）
-        z = norm.ppf(clamp(eff_delta, 0.02, 0.98))
-        ln_s_k = z * sigma * math.sqrt(t_years) - (0.03 + 0.5 * sigma**2) * t_years
-        strike = spot / math.exp(ln_s_k)
+        effective_delta = dynamic_delta(params.target_delta, trend_score)
+        strike = strike_from_delta(spot, effective_delta, sigma, t_years)
+        premium, model_delta, itm_prob = bs_call_metrics(spot, strike, t_years, sigma)
 
-        premium, itm_prob, delta = bs_call_price_itm_prob_delta(spot, strike, t_years, sigma)
-
-        expiry = find_expiry(idx, dt, cfg.dte)
+        expiry = next_trade_date(idx, dt, dte)
         if expiry is None:
             continue
-        st_exp = float(close.loc[expiry])
+        spot_expiry = float(close.loc[expiry])
 
-        pnl = premium - max(st_exp - strike, 0.0)
-        ret = pnl / spot
-        assigned = 1 if st_exp > strike else 0
+        pnl_per_share = premium - max(spot_expiry - strike, 0.0)
+        contracts = suggested_contracts(shares, vol_rank)
+        pnl_cash = pnl_per_share * contracts * 100.0
+        notional = spot * shares
+        ret_notional = pnl_cash / (notional + 1e-9)
 
         rows.append(
             {
                 "trade_date": dt.date(),
                 "expiry_date": expiry.date(),
                 "spot": spot,
-                "vol_rank": vr,
-                "trend_shape": tr,
-                "trend_label": trend_label(tr),
-                "delta_target_effective": eff_delta,
+                "spot_expiry": spot_expiry,
+                "vol_rank": vol_rank,
+                "trend_score": trend_score,
+                "trend_label": trend_label(trend_score),
+                "target_delta_effective": effective_delta,
+                "model_delta": model_delta,
                 "strike": strike,
                 "premium": premium,
-                "delta": delta,
                 "assignment_prob_model": itm_prob,
-                "spot_at_expiry": st_exp,
-                "assigned": assigned,
-                "pnl": pnl,
-                "return": ret,
-                "premium_yield_annualized": (premium / spot) * (365.0 / cfg.dte),
+                "assigned": int(spot_expiry > strike),
+                "contracts": contracts,
+                "premium_cash": premium * contracts * 100.0,
+                "pnl_per_share": pnl_per_share,
+                "pnl_cash": pnl_cash,
+                "return_on_notional": ret_notional,
+                "premium_yield_annualized": (premium / spot) * (365.0 / dte),
             }
         )
 
     bt = pd.DataFrame(rows)
     if bt.empty:
-        return bt, StrategyResult(cfg, 0, 1.0, 0.0, -1.0, -1.0, -1.0, 0.0, -1e9)
+        summary = StrategySummary(
+            params=params,
+            trades=0,
+            cagr=-1.0,
+            annual_return=-1.0,
+            assignment_rate=1.0,
+            win_rate=0.0,
+            max_drawdown=-1.0,
+            premium_yield_avg=0.0,
+            score=1e9,
+        )
+        return bt, summary
 
-    bt["equity"] = (1.0 + bt["return"]).cumprod()
-    dd = bt["equity"] / bt["equity"].cummax() - 1.0
+    bt["equity"] = (1.0 + bt["return_on_notional"]).cumprod()
+    bt["cum_pnl_cash"] = bt["pnl_cash"].cumsum()
 
-    years_real = max((pd.to_datetime(bt["expiry_date"]).iloc[-1] - pd.to_datetime(bt["trade_date"]).iloc[0]).days / 365.25, 1.0)
+    drawdown = bt["equity"] / bt["equity"].cummax() - 1.0
+    years_real = max(
+        (pd.to_datetime(bt["expiry_date"]).iloc[-1] - pd.to_datetime(bt["trade_date"]).iloc[0]).days / 365.25,
+        1.0,
+    )
+
     total = float(bt["equity"].iloc[-1])
     cagr = total ** (1.0 / years_real) - 1.0
-    mean_ret = float(bt["return"].mean())
-    trades_per_year = len(bt) / years_real
-    annualized_mean = mean_ret * trades_per_year
+    annual_return = float(bt["return_on_notional"].mean() * (len(bt) / years_real))
     assignment_rate = float(bt["assigned"].mean())
+    win_rate = float((bt["pnl_cash"] > 0).mean())
+    max_dd = float(drawdown.min())
     premium_yield_avg = float(bt["premium_yield_annualized"].mean())
 
-    # 评分：必须尽量稳定+低行权，并奖励达到5%年化
-    target_gap_penalty = max(0.05 - cagr, 0.0) * 8.0
+    # 目标：稳定 + 低指派 + 可持续收益
     score = (
-        target_gap_penalty
-        + assignment_rate * 2.2
-        + abs(float(dd.min())) * 1.4
-        + max(0.0, 0.01 - annualized_mean) * 4.0
-        - min(cagr, 0.30) * 1.2
-        - min(premium_yield_avg, 0.25) * 0.2
+        max(0.0, 0.05 - cagr) * 8.0
+        + assignment_rate * 2.4
+        + abs(max_dd) * 1.6
+        + max(0.0, 0.01 - annual_return) * 4.0
+        - min(cagr, 0.35) * 1.2
+        - min(premium_yield_avg, 0.30) * 0.25
     )
 
-    result = StrategyResult(
-        config=cfg,
+    summary = StrategySummary(
+        params=params,
         trades=int(len(bt)),
-        assignment_rate=assignment_rate,
-        win_rate=float((bt["pnl"] > 0).mean()),
         cagr=float(cagr),
-        annualized_mean=float(annualized_mean),
-        max_drawdown=float(dd.min()),
-        premium_yield_avg=float(premium_yield_avg),
+        annual_return=float(annual_return),
+        assignment_rate=assignment_rate,
+        win_rate=win_rate,
+        max_drawdown=max_dd,
+        premium_yield_avg=premium_yield_avg,
         score=float(score),
     )
-    return bt, result
+    return bt, summary
 
 
-def optimize_strategy(feat: pd.DataFrame) -> Tuple[StrategyResult, pd.DataFrame, List[StrategyResult]]:
-    deltas = [0.08, 0.10, 0.12, 0.15, 0.18, 0.22, 0.28]
-    dtes = [10, 14, 21, 28, 35, 45]
-    vol_windows = [
-        (0.00, 1.00),
-        (0.00, 0.80),
-        (0.20, 0.90),
-        (0.30, 0.95),
-        (0.40, 1.00),
-    ]
-    trend_windows = [
-        (-1.50, 1.50),
-        (-0.40, 1.50),
-        (-0.20, 1.50),
-        (0.00, 1.50),
-        (-1.50, 0.80),
-    ]
+def optimize_strategy(feat: pd.DataFrame, shares: int) -> Tuple[StrategySummary, pd.DataFrame, List[StrategySummary]]:
+    deltas = [0.08, 0.10, 0.12, 0.15, 0.18, 0.22]
+    dtes = [10, 14, 21, 28, 35]
+    vol_windows = [(0.00, 1.00), (0.00, 0.85), (0.20, 0.95), (0.30, 1.00)]
+    trend_windows = [(-1.50, 1.50), (-0.40, 1.20), (-0.20, 1.50), (0.00, 1.50)]
 
-    all_results: List[StrategyResult] = []
+    all_res: List[StrategySummary] = []
     bt_map: Dict[Tuple[float, int, float, float, float, float], pd.DataFrame] = {}
 
     for d in deltas:
-        for t in dtes:
+        for dte in dtes:
             for vmin, vmax in vol_windows:
-                for tr_min, tr_max in trend_windows:
-                    cfg = StrategyConfig(
+                for tmin, tmax in trend_windows:
+                    params = StrategyParams(
                         target_delta=d,
-                        dte=t,
+                        dte=dte,
                         vol_rank_min=vmin,
                         vol_rank_max=vmax,
-                        trend_min=tr_min,
-                        trend_max=tr_max,
+                        trend_min=tmin,
+                        trend_max=tmax,
                     )
-                    bt, res = simulate_short_call_leg(feat, cfg)
-                    all_results.append(res)
-                    bt_map[(d, t, vmin, vmax, tr_min, tr_max)] = bt
+                    bt, summary = backtest_single(feat, params, shares)
+                    key = (d, dte, vmin, vmax, tmin, tmax)
+                    bt_map[key] = bt
+                    all_res.append(summary)
 
     valid = [
         r
-        for r in all_results
-        if r.trades >= 30 and r.cagr >= 0.05 and r.assignment_rate <= 0.35 and r.max_drawdown >= -0.30
+        for r in all_res
+        if r.trades >= 30 and r.cagr >= 0.05 and r.assignment_rate <= 0.35 and r.max_drawdown >= -0.35
     ]
+    candidates = valid if valid else all_res
+    candidates = sorted(candidates, key=lambda x: x.score)
+    best = candidates[0]
 
-    if valid:
-        valid.sort(key=lambda x: x.score)
-        best = valid[0]
-    else:
-        # 如果严格条件下无策略，退化为最优稳健解并提示用户
-        all_results.sort(key=lambda x: x.score)
-        best = all_results[0]
-
-    k = (
-        best.config.target_delta,
-        best.config.dte,
-        best.config.vol_rank_min,
-        best.config.vol_rank_max,
-        best.config.trend_min,
-        best.config.trend_max,
+    key = (
+        best.params.target_delta,
+        best.params.dte,
+        best.params.vol_rank_min,
+        best.params.vol_rank_max,
+        best.params.trend_min,
+        best.params.trend_max,
     )
-    return best, bt_map[k], sorted(all_results, key=lambda x: x.score)[:12]
+    return best, bt_map[key], sorted(all_res, key=lambda x: x.score)[:12]
 
 
-def pick_live_option(
+def fetch_live_option_candidates(
     ticker: str,
-    target_delta: float,
-    target_dte: int,
-    trend_min: float,
-    trend_max: float,
-    min_premium_annualized: float,
+    params: StrategyParams,
+    min_annualized_yield: float,
     max_assignment_prob: float,
-) -> Tuple[LiveOption, pd.DataFrame, float, Dict[str, float]]:
+) -> Tuple[LiveOptionCandidate, pd.DataFrame, float, Dict[str, float]]:
     tk = yf.Ticker(ticker)
     px = tk.history(period="2y", auto_adjust=True)
     if px.empty:
         raise ValueError("无法获取最新价格。")
-    spot = float(px["Close"].iloc[-1])
-    feat_now = compute_features(px["Close"].dropna())
-    if feat_now.empty:
-        raise ValueError("历史数据不足，无法计算当前趋势形态。")
-    trend_now = float(feat_now["trend_shape"].iloc[-1])
-    trend_name = trend_label(trend_now)
-    in_trend_window = trend_min <= trend_now <= trend_max
-    target_delta_live = adjusted_delta(target_delta, trend_now)
 
-    exps = tk.options
-    if not exps:
+    close = px["Close"].dropna()
+    spot = float(close.iloc[-1])
+    feat_now = build_feature_frame(close)
+    if feat_now.empty:
+        raise ValueError("历史价格不足，无法计算当前状态。")
+
+    trend_score = float(feat_now["trend_score"].iloc[-1])
+    vol_rank = float(feat_now["vol_rank"].iloc[-1])
+    hv20 = float(feat_now["hv20"].iloc[-1])
+    target_delta_live = dynamic_delta(params.target_delta, trend_score)
+    trend_in_window = 1.0 if params.trend_min <= trend_score <= params.trend_max else 0.0
+
+    expirations = tk.options
+    if not expirations:
         raise ValueError("无法获取期权到期日。")
 
-    now = datetime.utcnow().date()
-    candidates: List[LiveOption] = []
+    today = datetime.utcnow().date()
+    candidates: List[LiveOptionCandidate] = []
 
-    for exp in exps:
-        dte = (datetime.strptime(exp, "%Y-%m-%d").date() - now).days
+    for exp in expirations:
+        exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
+        dte = (exp_date - today).days
         if dte < 7 or dte > 70:
             continue
 
-        chain = tk.option_chain(exp)
-        calls = chain.calls.copy()
+        calls = tk.option_chain(exp).calls.copy()
         if calls.empty:
             continue
 
-        wanted = ["strike", "lastPrice", "impliedVolatility", "volume", "openInterest", "delta"]
-        available = [c for c in wanted if c in calls.columns]
-        calls = calls[available].copy()
-        for c in wanted:
+        cols = ["strike", "lastPrice", "impliedVolatility", "volume", "openInterest", "delta"]
+        for c in cols:
             if c not in calls.columns:
                 calls[c] = np.nan
 
         for _, row in calls.iterrows():
-            strike = safe_float(row.get("strike"))
-            premium = safe_float(row.get("lastPrice"), 0.0)
+            strike = safe_float(row.get("strike"), np.nan)
+            premium = safe_float(row.get("lastPrice"), np.nan)
             iv = safe_float(row.get("impliedVolatility"), np.nan)
             delta_raw = safe_float(row.get("delta"), np.nan)
-            vol = safe_float(row.get("volume"), 0.0)
+            volume = safe_float(row.get("volume"), 0.0)
             oi = safe_float(row.get("openInterest"), 0.0)
 
-            if np.isnan(strike) or strike <= spot or premium <= 0:
+            if np.isnan(strike) or strike <= spot:
+                continue
+            if np.isnan(premium) or premium <= 0:
                 continue
 
-            sigma = iv if not np.isnan(iv) and iv > 0 else 0.35
-            t_years = dte / 365.0
-            _, itm_prob, bsm_delta = bs_call_price_itm_prob_delta(spot, strike, t_years, sigma)
-            delta = abs(delta_raw) if not np.isnan(delta_raw) else bsm_delta
+            sigma = iv if not np.isnan(iv) and iv > 0 else max(hv20, 0.20)
+            _, model_delta, itm_prob = bs_call_metrics(spot, strike, dte / 365.0, sigma)
+            delta = abs(delta_raw) if not np.isnan(delta_raw) else model_delta
+            assignment_prob = max(itm_prob, min(delta, 1.0))
+            annualized_yield = (premium / spot) * (365.0 / max(dte, 1))
 
-            annualized = (premium / spot) * (365.0 / dte)
-            assign_prob = max(itm_prob, min(delta, 1.0))
-
-            if annualized < min_premium_annualized:
+            if annualized_yield < min_annualized_yield:
                 continue
-            if assign_prob > max_assignment_prob:
+            if assignment_prob > max_assignment_prob:
                 continue
 
             score = (
                 abs(delta - target_delta_live) * 1.8
-                + abs(dte - target_dte) / 30.0 * 0.8
-                + assign_prob * 0.25
-                - min(annualized, 0.60) * 0.2
-                + (0.05 if (vol <= 0 and oi <= 0) else 0.0)
+                + abs(dte - params.dte) / 30.0 * 0.8
+                + assignment_prob * 0.25
+                - min(annualized_yield, 0.60) * 0.2
+                + (0.05 if (volume <= 0 and oi <= 0) else 0.0)
             )
 
             candidates.append(
-                LiveOption(
+                LiveOptionCandidate(
                     expiration=exp,
                     dte=dte,
-                    strike=strike,
-                    premium=premium,
-                    iv=sigma,
-                    assignment_prob=assign_prob,
-                    premium_yield_annualized=annualized,
-                    volume=vol,
-                    open_interest=oi,
-                    score=score,
+                    strike=float(strike),
+                    premium=float(premium),
+                    iv=float(sigma),
+                    delta=float(delta),
+                    assignment_prob=float(assignment_prob),
+                    annualized_yield=float(annualized_yield),
+                    volume=float(volume),
+                    open_interest=float(oi),
+                    score=float(score),
                 )
             )
 
     if not candidates:
-        raise ValueError("当前没有满足条件的可卖call。可放宽行权概率或最低年化约束。")
+        raise ValueError("当前没有满足约束的可卖Call；可放宽年化或行权概率上限。")
 
     candidates.sort(key=lambda x: x.score)
     best = candidates[0]
 
-    top = pd.DataFrame(
+    top_df = pd.DataFrame(
         [
             {
                 "expiration": c.expiration,
                 "dte": c.dte,
                 "strike": c.strike,
                 "premium": c.premium,
-                "annualized_yield": c.premium_yield_annualized,
+                "delta": c.delta,
+                "annualized_yield": c.annualized_yield,
                 "assignment_prob": c.assignment_prob,
                 "iv": c.iv,
                 "volume": c.volume,
@@ -443,280 +544,565 @@ def pick_live_option(
             for c in candidates[:12]
         ]
     )
-    return best, top, spot, {
-        "trend_shape": trend_now,
-        "trend_label": trend_name,
+
+    ctx = {
+        "trend_score": trend_score,
+        "vol_rank": vol_rank,
+        "hv20": hv20,
         "target_delta_live": target_delta_live,
-        "trend_in_window": 1.0 if in_trend_window else 0.0,
+        "trend_in_window": trend_in_window,
     }
+    return best, top_df, spot, ctx
 
 
-def pct(x: float) -> str:
-    return f"{x * 100:.2f}%"
+def build_step_by_step_plan(
+    ticker: str,
+    shares: int,
+    spot: float,
+    params: StrategyParams,
+    recommendation: LiveOptionCandidate,
+    market_ctx: Dict[str, float],
+    next_earnings: Optional[date],
+) -> List[str]:
+    today = datetime.utcnow().date()
+    contracts_max = shares // 100
+    contracts = suggested_contracts(shares, float(market_ctx.get("vol_rank", 0.5)))
+    uncovered = max(shares - contracts * 100, 0)
+
+    close_trigger_mark = max(recommendation.premium * (1.0 - params.take_profit_pct), 0.01)
+    soft_roll_spot = recommendation.strike * params.roll_spot_ratio
+    hard_roll_spot = recommendation.strike * params.hard_defense_spot_ratio
+
+    lines: List[str] = []
+    lines.append(
+        f"仓位分配：共 {shares} 股 `{ticker}`，上限 {contracts_max} 张；当前建议先卖 {contracts} 张，保留 {uncovered} 股不覆盖。"
+    )
+
+    if next_earnings is None:
+        lines.append("财报规则：未获取到下次财报日期，按常规执行但开仓前请手动确认财报时间。")
+    else:
+        days = (next_earnings - today).days
+        if 0 <= days <= 7:
+            lines.append(f"财报规则：下次财报约 {next_earnings}（{days}天后），进入禁卖窗口，暂停新开仓。")
+        else:
+            lines.append(f"财报规则：下次财报约 {next_earnings}，当前不在7天禁卖窗口，可开仓。")
+
+    lines.append(
+        f"开仓：`Sell to Open` {contracts} 张 `{ticker}` {recommendation.expiration} {recommendation.strike:.2f}C，目标权利金约 ${recommendation.premium:.2f}/股。"
+    )
+    lines.append(
+        f"止盈：当期权价格 <= ${close_trigger_mark:.2f}/股（约锁定70%利润）时，`Buy to Close`。"
+    )
+    lines.append(
+        f"滚动防守：若 Delta >= {params.roll_delta:.2f} 或股价 >= ${soft_roll_spot:.2f}（执行价98%），执行 `Roll Up & Out`（+7到14天并抬高执行价，优先净收credit）。"
+    )
+    lines.append(
+        f"到期硬规则：若 DTE <= {params.hard_defense_dte} 且股价 >= ${hard_roll_spot:.2f}（执行价99%），当日平仓或滚动，不留到到期。"
+    )
+    lines.append("日常检查：每个交易日收盘前检查 DTE、Delta、与执行价距离，触发即执行。")
+    return lines
 
 
-def build_strategy_explanation(
-    strategy: StrategyResult,
-    user_target_cagr: float,
-    user_max_assign: float,
-) -> str:
-    if strategy.cagr >= user_target_cagr:
-        top_line = (
-            f"结论：该策略在8年回测中达到你设定的目标（CAGR {pct(strategy.cagr)} >= {pct(user_target_cagr)}），"
-            f"且行权率 {pct(strategy.assignment_rate)} 在你设定上限 {pct(user_max_assign)} 以内。"
+def pick_mark_delta_iv(calls: pd.DataFrame, wanted_strike: float, spot: float, dte: int) -> Tuple[float, float, float, float]:
+    if calls.empty:
+        intrinsic = max(spot - wanted_strike, 0.0)
+        mark = intrinsic + (0.10 if dte > 0 else 0.0)
+        delta = 0.95 if spot > wanted_strike else 0.05
+        return mark, delta, 0.35, wanted_strike
+
+    df = calls.copy()
+    for c in ["strike", "bid", "ask", "lastPrice", "impliedVolatility", "delta"]:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    df["distance"] = (df["strike"] - wanted_strike).abs()
+    row = df.sort_values("distance").iloc[0]
+
+    matched_strike = safe_float(row.get("strike"), wanted_strike)
+    bid = safe_float(row.get("bid"), np.nan)
+    ask = safe_float(row.get("ask"), np.nan)
+    last = safe_float(row.get("lastPrice"), np.nan)
+    iv = safe_float(row.get("impliedVolatility"), np.nan)
+    delta_raw = safe_float(row.get("delta"), np.nan)
+
+    if not np.isnan(bid) and not np.isnan(ask) and bid > 0 and ask > 0 and ask >= bid:
+        mark = (bid + ask) / 2.0
+    elif not np.isnan(last) and last > 0:
+        mark = last
+    else:
+        intrinsic = max(spot - matched_strike, 0.0)
+        mark = intrinsic + (0.10 if dte > 0 else 0.0)
+
+    sigma = iv if not np.isnan(iv) and iv > 0 else 0.35
+    _, model_delta, _ = bs_call_metrics(spot, matched_strike, max(dte, 1) / 365.0, sigma)
+    delta = abs(delta_raw) if not np.isnan(delta_raw) else model_delta
+
+    return float(mark), float(delta), float(sigma), float(matched_strike)
+
+
+def decide_action(
+    params: StrategyParams,
+    spot: float,
+    strike: float,
+    dte: int,
+    delta: float,
+    pnl_pct: float,
+    next_earnings: Optional[date],
+) -> Tuple[str, str]:
+    today = datetime.utcnow().date()
+    days_to_earnings = (next_earnings - today).days if next_earnings is not None else None
+    crosses_earnings = days_to_earnings is not None and days_to_earnings >= 0 and dte >= days_to_earnings
+
+    if not np.isnan(pnl_pct) and pnl_pct >= params.take_profit_pct:
+        return "Close", "达到止盈阈值（>=70%），先锁定利润。"
+
+    if dte <= 0:
+        if spot > strike:
+            return "已到期/高概率被行权", "到期且价内。"
+        return "已到期", "到期且价外。"
+
+    if crosses_earnings and days_to_earnings is not None and days_to_earnings <= 2:
+        return "Close 或 Roll", "仓位将跨财报且距离财报<=2天。"
+
+    if dte <= params.hard_defense_dte and spot >= strike * params.hard_defense_spot_ratio:
+        return "Roll Up & Out", "临近到期且接近/进入价内，按硬规则防守。"
+
+    if delta >= params.roll_delta or spot >= strike * params.roll_spot_ratio:
+        return "Roll Up & Out", "Delta或价格触发防守阈值。"
+
+    if crosses_earnings and days_to_earnings is not None and days_to_earnings <= 7:
+        return "考虑提前Close", "财报前7天窗口，优先控风险。"
+
+    return "Hold", "未触发止盈/风控阈值。"
+
+
+def evaluate_positions(
+    ticker: str,
+    params: StrategyParams,
+    spot: float,
+    positions_df: pd.DataFrame,
+    next_earnings: Optional[date],
+) -> pd.DataFrame:
+    if positions_df.empty:
+        return pd.DataFrame()
+
+    tk = yf.Ticker(ticker)
+    chain_cache: Dict[str, pd.DataFrame] = {}
+    today = datetime.utcnow().date()
+    out_rows: List[Dict[str, object]] = []
+
+    for _, row in positions_df.iterrows():
+        expiration = str(row.get("expiration", "")).strip()
+        strike = safe_float(row.get("strike"), np.nan)
+        contracts = int(safe_float(row.get("contracts"), 0))
+        premium_collected = safe_float(row.get("premium_collected"), np.nan)
+
+        exp_date = parse_date(expiration)
+        if exp_date is None or np.isnan(strike) or np.isnan(premium_collected) or contracts <= 0:
+            continue
+
+        dte = (exp_date - today).days
+        if expiration not in chain_cache:
+            try:
+                chain_cache[expiration] = tk.option_chain(expiration).calls.copy()
+            except Exception:
+                chain_cache[expiration] = pd.DataFrame()
+
+        mark, delta, iv, matched_strike = pick_mark_delta_iv(chain_cache[expiration], strike, spot, dte)
+
+        pnl_per_share = premium_collected - mark
+        pnl_cash = pnl_per_share * contracts * 100.0
+        pnl_pct = pnl_per_share / premium_collected if premium_collected > 0 else np.nan
+        close_trigger_mark = max(premium_collected * (1.0 - params.take_profit_pct), 0.01)
+
+        action, reason = decide_action(
+            params=params,
+            spot=spot,
+            strike=strike,
+            dte=dte,
+            delta=delta,
+            pnl_pct=pnl_pct,
+            next_earnings=next_earnings,
+        )
+
+        advice = PositionAdvice(
+            expiration=expiration,
+            dte=dte,
+            strike=float(strike),
+            matched_strike=float(matched_strike),
+            contracts=contracts,
+            premium_collected=float(premium_collected),
+            mark=float(mark),
+            delta=float(delta),
+            iv=float(iv),
+            spot=float(spot),
+            pnl_cash=float(pnl_cash),
+            pnl_pct=float(pnl_pct if not np.isnan(pnl_pct) else 0.0),
+            close_trigger_mark=float(close_trigger_mark),
+            action=action,
+            reason=reason,
+        )
+        out_rows.append(advice.__dict__)
+
+    if not out_rows:
+        return pd.DataFrame()
+    return pd.DataFrame(out_rows)
+
+
+def make_strategy_explanation(summary: StrategySummary, target_cagr: float, max_assign: float) -> str:
+    if summary.cagr >= target_cagr:
+        head = (
+            f"结论：回测满足目标（CAGR {pct(summary.cagr)} >= {pct(target_cagr)}），"
+            f"行权率 {pct(summary.assignment_rate)} 在上限 {pct(max_assign)} 内。"
         )
     else:
-        top_line = (
-            f"结论：在当前模型与约束下，未达到你设定的目标年化 {pct(user_target_cagr)}；"
-            f"当前最稳健候选 CAGR 为 {pct(strategy.cagr)}。"
+        head = (
+            f"结论：回测未达到你设定的目标年化 {pct(target_cagr)}；"
+            f"当前最优候选 CAGR 为 {pct(summary.cagr)}。"
         )
 
-    delta_text = (
-        f"- 目标Delta `{strategy.config.target_delta:.2f}`：数值越低，执行价越远离现价，通常更不易被行权，但权利金也更少。"
-    )
-    dte_text = f"- 目标DTE `{strategy.config.dte}天`：表示每次卖出约 `{strategy.config.dte}` 天到期的 call。"
-    vol_text = (
-        f"- 波动率分位过滤 `{strategy.config.vol_rank_min:.2f}-{strategy.config.vol_rank_max:.2f}`："
-        "仅在该波动率区间内开仓。"
-    )
-    trend_text = (
-        f"- 价格形态趋势过滤 `{strategy.config.trend_min:.2f}-{strategy.config.trend_max:.2f}`："
-        "仅在该趋势形态分数区间开仓；强上行时会自动下调delta，减少被行权概率。"
-    )
-    perf_text = (
-        f"- 收益与风险：8年CAGR `{pct(strategy.cagr)}`，最大回撤 `{pct(strategy.max_drawdown)}`，"
-        f"行权率 `{pct(strategy.assignment_rate)}`，胜率 `{pct(strategy.win_rate)}`。"
-    )
-    premium_gap_text = (
-        f"- 为什么“平均权利金年化 `{pct(strategy.premium_yield_avg)}`”可能高于策略CAGR："
-        "权利金是毛收入，遇到标的大涨导致的被行权亏损会侵蚀净收益，因此最终复利可能明显低于权利金年化。"
-    )
-    sample_text = f"- 交易次数 `{strategy.trades}`：样本越多，结论通常越稳健。"
-
-    return "\n".join([top_line, delta_text, dte_text, vol_text, trend_text, perf_text, premium_gap_text, sample_text])
+    details = [
+        f"- Delta `{summary.params.target_delta:.2f}`，DTE `{summary.params.dte}` 天。",
+        (
+            f"- 波动率过滤 `{summary.params.vol_rank_min:.2f}-{summary.params.vol_rank_max:.2f}`，"
+            f"趋势过滤 `{summary.params.trend_min:.2f}-{summary.params.trend_max:.2f}`。"
+        ),
+        (
+            f"- 指标：交易数 `{summary.trades}`，胜率 `{pct(summary.win_rate)}`，"
+            f"最大回撤 `{pct(summary.max_drawdown)}`，平均权利金年化 `{pct(summary.premium_yield_avg)}`。"
+        ),
+        "- 注意：权利金是毛收入，标的大涨导致的价内损失会侵蚀净收益。",
+    ]
+    return "\n".join([head] + details)
 
 
 def render_app() -> None:
-    st.set_page_config(page_title="8年卖Call策略搜索器", layout="wide")
-    st.title("8年历史 + 波动率 + 价格形态 的 Sell Call 策略搜索器")
-    st.caption("目标：找到可稳定收权利金、低行权率、且年化>=5%的策略；并给出当前可执行合约（研究用途）。")
+    st.set_page_config(page_title="TSLA Sell Call 策略程序", layout="wide")
+    st.title("TSLA Sell Call 策略程序")
+    st.caption("从零重构版：8年回测 + 当前Step-by-Step + 已卖Call Close/Hold/Roll 管理")
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
         ticker = st.text_input("股票代码", value="TSLA").strip().upper()
-    with col2:
-        min_target_cagr_pct = st.number_input("最低目标年化(%)", min_value=1.0, max_value=30.0, value=5.0, step=0.5)
-    with col3:
+    with c2:
+        shares = int(st.number_input("持股数量", min_value=100, max_value=200000, value=400, step=100))
+    with c3:
+        target_cagr_pct = st.number_input("目标年化(%)", min_value=1.0, max_value=30.0, value=5.0, step=0.5)
+    with c4:
         max_assign_pct = st.number_input("行权概率上限(%)", min_value=1.0, max_value=95.0, value=20.0, step=1.0)
 
-    if st.button("搜索策略并给出当前建议", type="primary"):
+    run = st.button("运行分析", type="primary")
+    if run:
         try:
-            with st.spinner("加载8年历史并搜索最优策略..."):
-                close = load_price_history(ticker, years=8)
-                feat = compute_features(close)
-                best_strategy, bt, top_strategies = optimize_strategy(feat)
+            with st.spinner("加载历史数据并回测..."):
+                close = load_close_history(ticker, years=8)
+                feat = build_feature_frame(close)
+                best_summary, bt, top_summaries = optimize_strategy(feat, shares)
 
-            # 动态强制用户目标门槛
-            user_target_cagr = min_target_cagr_pct / 100.0
-            if best_strategy.cagr < user_target_cagr:
-                st.warning(
-                    f"在当前模型与约束下，未找到满足你设定年化 {min_target_cagr_pct:.1f}% 的策略。"
-                    f" 当前最稳健候选年化约 {best_strategy.cagr*100:.2f}%。"
-                )
+            params = best_summary.params
+            target_cagr = target_cagr_pct / 100.0
+            max_assign = max_assign_pct / 100.0
 
-            st.subheader("筛选出的策略")
-            s1, s2, s3, s4 = st.columns(4)
-            s1.metric("目标Delta", f"{best_strategy.config.target_delta:.2f}")
-            s2.metric("目标DTE", f"{best_strategy.config.dte} 天")
-            s3.metric("波动率分位过滤", f"{best_strategy.config.vol_rank_min:.2f}-{best_strategy.config.vol_rank_max:.2f}")
-            s4.metric("趋势形态过滤", f"{best_strategy.config.trend_min:.2f}-{best_strategy.config.trend_max:.2f}")
+            live_best = None
+            live_top = pd.DataFrame()
+            live_ctx: Dict[str, float] = {}
+            live_error = ""
+            spot = float(close.iloc[-1])
 
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("8年CAGR", pct(best_strategy.cagr))
-            m2.metric("年化均值", pct(best_strategy.annualized_mean))
-            m3.metric("行权率", pct(best_strategy.assignment_rate))
-            m4.metric("最大回撤", pct(best_strategy.max_drawdown))
+            with st.spinner("匹配当前市场期权..."):
+                try:
+                    live_best, live_top, spot, live_ctx = fetch_live_option_candidates(
+                        ticker=ticker,
+                        params=params,
+                        min_annualized_yield=target_cagr,
+                        max_assignment_prob=max_assign,
+                    )
+                except Exception as ex:
+                    live_error = str(ex)
 
-            m5, m6, m7 = st.columns(3)
-            m5.metric("交易次数", best_strategy.trades)
-            m6.metric("胜率", pct(best_strategy.win_rate))
-            m7.metric("平均权利金年化", pct(best_strategy.premium_yield_avg))
+            next_earnings = get_next_earnings_date(ticker)
+            search_id = datetime.utcnow().strftime("%Y%m%d%H%M%S")
 
-            st.subheader("结果解读")
-            st.markdown(
-                build_strategy_explanation(
-                    strategy=best_strategy,
-                    user_target_cagr=user_target_cagr,
-                    user_max_assign=max_assign_pct / 100.0,
-                )
-            )
-
-            st.subheader("回测净值（含每笔交易Marker）")
-            bt_plot = bt.copy()
-            bt_plot["trade_date"] = pd.to_datetime(bt_plot["trade_date"])
-            bt_plot["case_id"] = np.arange(1, len(bt_plot) + 1)
-            bt_plot["assigned_label"] = bt_plot["assigned"].map({1: "被行权", 0: "未行权"})
-
-            equity_line = (
-                alt.Chart(bt_plot)
-                .mark_line(strokeWidth=2)
-                .encode(
-                    x=alt.X("trade_date:T", title="开仓日期"),
-                    y=alt.Y("equity:Q", title="净值"),
-                )
-            )
-            equity_points = (
-                alt.Chart(bt_plot)
-                .mark_point(size=70, filled=True)
-                .encode(
-                    x=alt.X("trade_date:T", title="开仓日期"),
-                    y=alt.Y("equity:Q", title="净值"),
-                    color=alt.Color("assigned_label:N", title="到期结果"),
-                    tooltip=[
-                        alt.Tooltip("case_id:Q", title="Case"),
-                        alt.Tooltip("trade_date:T", title="开仓日"),
-                        alt.Tooltip("expiry_date:N", title="到期日"),
-                        alt.Tooltip("equity:Q", format=".4f", title="净值"),
-                        alt.Tooltip("return:Q", format=".2%", title="单笔收益"),
-                        alt.Tooltip("assigned_label:N", title="是否行权"),
-                    ],
-                )
-            )
-            st.altair_chart((equity_line + equity_points).interactive(), use_container_width=True)
-
-            st.subheader("每个Case收益点图")
-            returns_points = (
-                alt.Chart(bt_plot)
-                .mark_circle(size=90)
-                .encode(
-                    x=alt.X("trade_date:T", title="开仓日期"),
-                    y=alt.Y("return:Q", title="单笔收益率", axis=alt.Axis(format="%")),
-                    color=alt.Color("assigned_label:N", title="到期结果"),
-                    tooltip=[
-                        alt.Tooltip("case_id:Q", title="Case"),
-                        alt.Tooltip("trade_date:T", title="开仓日"),
-                        alt.Tooltip("expiry_date:N", title="到期日"),
-                        alt.Tooltip("strike:Q", format=".2f", title="执行价"),
-                        alt.Tooltip("premium:Q", format=".2f", title="权利金"),
-                        alt.Tooltip("return:Q", format=".2%", title="单笔收益"),
-                        alt.Tooltip("assigned_label:N", title="是否行权"),
-                    ],
-                )
-            )
-            zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(strokeDash=[6, 4]).encode(y="y:Q")
-            st.altair_chart((zero_line + returns_points).interactive(), use_container_width=True)
-
-            st.subheader("策略候选Top12")
-            tdf = pd.DataFrame(
-                [
-                    {
-                        "target_delta": r.config.target_delta,
-                        "dte": r.config.dte,
-                        "vol_rank_min": r.config.vol_rank_min,
-                        "vol_rank_max": r.config.vol_rank_max,
-                        "trend_min": r.config.trend_min,
-                        "trend_max": r.config.trend_max,
-                        "trades": r.trades,
-                        "cagr": r.cagr,
-                        "assignment_rate": r.assignment_rate,
-                        "max_drawdown": r.max_drawdown,
-                        "score": r.score,
-                    }
-                    for r in top_strategies
-                ]
-            )
-            st.dataframe(
-                tdf.style.format(
-                    {
-                        "cagr": "{:.2%}",
-                        "assignment_rate": "{:.2%}",
-                        "max_drawdown": "{:.2%}",
-                        "score": "{:.3f}",
-                    }
-                ),
-                use_container_width=True,
-            )
-
-            with st.spinner("根据最佳策略匹配当前可卖call..."):
-                live_best, live_top, spot, live_ctx = pick_live_option(
-                    ticker=ticker,
-                    target_delta=best_strategy.config.target_delta,
-                    target_dte=best_strategy.config.dte,
-                    trend_min=best_strategy.config.trend_min,
-                    trend_max=best_strategy.config.trend_max,
-                    min_premium_annualized=user_target_cagr,
-                    max_assignment_prob=max_assign_pct / 100.0,
-                )
-
-            st.subheader("当前形态趋势状态")
-            l1, l2, l3 = st.columns(3)
-            l1.metric("趋势形态分数", f"{live_ctx['trend_shape']:.2f}")
-            l2.metric("形态标签", str(live_ctx["trend_label"]))
-            l3.metric("实时目标Delta(调整后)", f"{live_ctx['target_delta_live']:.2f}")
-            if live_ctx["trend_in_window"] < 0.5:
-                st.info("当前形态趋势不在策略最优开仓区间内，建议等待更匹配的价格形态。")
-
-            st.subheader("当前时刻建议卖出的Call")
-            rec = {
-                "Ticker": ticker,
-                "Spot": f"${spot:.2f}",
-                "Expiration": live_best.expiration,
-                "DTE": live_best.dte,
-                "Strike": f"${live_best.strike:.2f}",
-                "Premium": f"${live_best.premium:.2f}",
-                "权利金年化": pct(live_best.premium_yield_annualized),
-                "估计行权概率": pct(live_best.assignment_prob),
-                "IV": pct(live_best.iv),
-                "Volume": int(live_best.volume),
-                "Open Interest": int(live_best.open_interest),
+            st.session_state["analysis"] = {
+                "id": search_id,
+                "ticker": ticker,
+                "shares": shares,
+                "target_cagr": target_cagr,
+                "max_assign": max_assign,
+                "best_summary": best_summary,
+                "bt": bt,
+                "top_summaries": top_summaries,
+                "spot": spot,
+                "live_best": live_best,
+                "live_top": live_top,
+                "live_ctx": live_ctx,
+                "live_error": live_error,
+                "next_earnings": next_earnings,
             }
-            st.table(pd.DataFrame([rec]))
 
-            st.subheader("当前备选合约Top12")
-            st.dataframe(
-                live_top.style.format(
-                    {
-                        "strike": "${:.2f}",
-                        "premium": "${:.2f}",
-                        "annualized_yield": "{:.2%}",
-                        "assignment_prob": "{:.2%}",
-                        "iv": "{:.2%}",
-                    }
-                ),
-                use_container_width=True,
-            )
-
-            st.subheader("最佳策略回测明细")
-            st.dataframe(
-                bt.style.format(
-                    {
-                        "spot": "${:.2f}",
-                        "trend_shape": "{:.2f}",
-                        "delta_target_effective": "{:.2f}",
-                        "strike": "${:.2f}",
-                        "premium": "${:.2f}",
-                        "delta": "{:.2f}",
-                        "assignment_prob_model": "{:.2%}",
-                        "spot_at_expiry": "${:.2f}",
-                        "pnl": "${:.2f}",
-                        "return": "{:.2%}",
-                        "premium_yield_annualized": "{:.2%}",
-                        "equity": "{:.4f}",
-                    }
-                ),
-                use_container_width=True,
-            )
-
-            csv = bt.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "下载最佳策略回测CSV",
-                data=csv,
-                file_name=f"{ticker}_8y_sell_call_strategy_backtest.csv",
-                mime="text/csv",
-            )
+            if live_best is not None:
+                seed_contracts = suggested_contracts(shares, float(live_ctx.get("vol_rank", 0.5)))
+                seed_csv = (
+                    "expiration,strike,contracts,premium_collected\n"
+                    f"{live_best.expiration},{live_best.strike:.2f},{seed_contracts},{live_best.premium:.2f}\n"
+                )
+            else:
+                seed_csv = "expiration,strike,contracts,premium_collected\n"
+            st.session_state[f"position_seed_{search_id}"] = seed_csv
 
         except Exception as e:
             st.error(f"执行失败: {e}")
+            return
+
+    if "analysis" not in st.session_state:
+        return
+
+    analysis = st.session_state["analysis"]
+    best: StrategySummary = analysis["best_summary"]
+    bt: pd.DataFrame = analysis["bt"]
+    top_summaries: List[StrategySummary] = analysis["top_summaries"]
+    live_best: Optional[LiveOptionCandidate] = analysis["live_best"]
+    live_top: pd.DataFrame = analysis["live_top"]
+    live_ctx: Dict[str, float] = analysis["live_ctx"]
+    spot: float = float(analysis["spot"])
+    next_earnings: Optional[date] = analysis["next_earnings"]
+
+    st.subheader("策略参数")
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Delta", f"{best.params.target_delta:.2f}")
+    s2.metric("DTE", f"{best.params.dte} 天")
+    s3.metric("波动率过滤", f"{best.params.vol_rank_min:.2f}-{best.params.vol_rank_max:.2f}")
+    s4.metric("趋势过滤", f"{best.params.trend_min:.2f}-{best.params.trend_max:.2f}")
+
+    st.subheader("8年回测结果")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("CAGR", pct(best.cagr))
+    m2.metric("年化均值", pct(best.annual_return))
+    m3.metric("行权率", pct(best.assignment_rate))
+    m4.metric("最大回撤", pct(best.max_drawdown))
+
+    m5, m6, m7 = st.columns(3)
+    m5.metric("交易次数", best.trades)
+    m6.metric("胜率", pct(best.win_rate))
+    m7.metric("平均权利金年化", pct(best.premium_yield_avg))
+
+    total_pnl = float(bt["pnl_cash"].sum()) if not bt.empty else 0.0
+    years_real = max(
+        (pd.to_datetime(bt["expiry_date"]).iloc[-1] - pd.to_datetime(bt["trade_date"]).iloc[0]).days / 365.25,
+        1.0,
+    ) if not bt.empty else 1.0
+    avg_annual_pnl = total_pnl / years_real
+    avg_notional = float((bt["spot"] * shares).mean()) if not bt.empty else 0.0
+    annual_yield = avg_annual_pnl / (avg_notional + 1e-9)
+
+    p1, p2, p3 = st.columns(3)
+    p1.metric("累计期权P/L", f"${total_pnl:,.0f}")
+    p2.metric("年均期权P/L", f"${avg_annual_pnl:,.0f}")
+    p3.metric("期权腿年化收益率", pct(annual_yield))
+
+    st.subheader("结果解读")
+    st.markdown(make_strategy_explanation(best, analysis["target_cagr"], analysis["max_assign"]))
+
+    bt_plot = bt.copy()
+    if not bt_plot.empty:
+        bt_plot["trade_date"] = pd.to_datetime(bt_plot["trade_date"])
+        bt_plot["case_id"] = np.arange(1, len(bt_plot) + 1)
+        bt_plot["assigned_label"] = bt_plot["assigned"].map({1: "被行权", 0: "未行权"})
+
+        st.subheader("回测净值")
+        equity_line = (
+            alt.Chart(bt_plot)
+            .mark_line(strokeWidth=2)
+            .encode(
+                x=alt.X("trade_date:T", title="开仓日期"),
+                y=alt.Y("equity:Q", title="净值"),
+            )
+        )
+        points = (
+            alt.Chart(bt_plot)
+            .mark_point(size=70, filled=True)
+            .encode(
+                x=alt.X("trade_date:T", title="开仓日期"),
+                y=alt.Y("equity:Q", title="净值"),
+                color=alt.Color("assigned_label:N", title="到期结果"),
+                tooltip=[
+                    alt.Tooltip("case_id:Q", title="Case"),
+                    alt.Tooltip("trade_date:T", title="开仓日"),
+                    alt.Tooltip("expiry_date:N", title="到期日"),
+                    alt.Tooltip("pnl_cash:Q", format=",.0f", title="P/L($)"),
+                    alt.Tooltip("return_on_notional:Q", format=".2%", title="单笔收益"),
+                    alt.Tooltip("assigned_label:N", title="是否行权"),
+                ],
+            )
+        )
+        st.altair_chart((equity_line + points).interactive(), use_container_width=True)
+
+    st.subheader("策略候选Top12")
+    top_df = pd.DataFrame(
+        [
+            {
+                "delta": r.params.target_delta,
+                "dte": r.params.dte,
+                "vol_rank_min": r.params.vol_rank_min,
+                "vol_rank_max": r.params.vol_rank_max,
+                "trend_min": r.params.trend_min,
+                "trend_max": r.params.trend_max,
+                "trades": r.trades,
+                "cagr": r.cagr,
+                "assignment_rate": r.assignment_rate,
+                "max_drawdown": r.max_drawdown,
+                "score": r.score,
+            }
+            for r in top_summaries
+        ]
+    )
+    st.dataframe(
+        top_df.style.format(
+            {
+                "cagr": "{:.2%}",
+                "assignment_rate": "{:.2%}",
+                "max_drawdown": "{:.2%}",
+                "score": "{:.3f}",
+            }
+        ),
+        use_container_width=True,
+    )
+
+    if live_best is None:
+        st.warning(f"当前市场建议生成失败：{analysis['live_error']}")
+    else:
+        st.subheader("当前市场建议")
+        l1, l2, l3, l4 = st.columns(4)
+        l1.metric("Spot", f"${spot:.2f}")
+        l2.metric("趋势分数", f"{float(live_ctx.get('trend_score', 0.0)):.2f}")
+        l3.metric("波动率分位", f"{float(live_ctx.get('vol_rank', 0.0)):.2f}")
+        l4.metric("实时目标Delta", f"{float(live_ctx.get('target_delta_live', 0.0)):.2f}")
+
+        rec = {
+            "Ticker": analysis["ticker"],
+            "Expiration": live_best.expiration,
+            "DTE": live_best.dte,
+            "Strike": f"${live_best.strike:.2f}",
+            "Premium": f"${live_best.premium:.2f}",
+            "Delta": f"{live_best.delta:.2f}",
+            "估计行权概率": pct(live_best.assignment_prob),
+            "权利金年化": pct(live_best.annualized_yield),
+            "IV": pct(live_best.iv),
+            "下次财报": str(next_earnings) if next_earnings else "未知",
+        }
+        st.table(pd.DataFrame([rec]))
+
+        st.subheader("Step-by-Step 操作清单")
+        steps = build_step_by_step_plan(
+            ticker=analysis["ticker"],
+            shares=shares,
+            spot=spot,
+            params=best.params,
+            recommendation=live_best,
+            market_ctx=live_ctx,
+            next_earnings=next_earnings,
+        )
+        for i, line in enumerate(steps, start=1):
+            st.markdown(f"{i}. {line}")
+
+        st.subheader("当前备选Call Top12")
+        st.dataframe(
+            live_top.style.format(
+                {
+                    "strike": "${:.2f}",
+                    "premium": "${:.2f}",
+                    "delta": "{:.2f}",
+                    "annualized_yield": "{:.2%}",
+                    "assignment_prob": "{:.2%}",
+                    "iv": "{:.2%}",
+                }
+            ),
+            use_container_width=True,
+        )
+
+        st.subheader("已卖出Call管理：Close / Hold / Roll")
+        st.caption("CSV格式：expiration,strike,contracts,premium_collected（premium_collected按每股填写）")
+
+        sid = analysis["id"]
+        csv_key = f"positions_csv_{sid}"
+        default_csv = st.session_state.get(f"position_seed_{sid}", "expiration,strike,contracts,premium_collected\n")
+        csv_text = st.text_area("输入持仓CSV", key=csv_key, value=default_csv, height=130)
+
+        eval_key = f"positions_eval_{sid}"
+        if st.button("评估持仓"):
+            try:
+                pos_df = pd.read_csv(StringIO(csv_text))
+                required = {"expiration", "strike", "contracts", "premium_collected"}
+                miss = [c for c in required if c not in pos_df.columns]
+                if miss:
+                    st.error(f"CSV缺少字段: {', '.join(miss)}")
+                else:
+                    st.session_state[eval_key] = evaluate_positions(
+                        ticker=analysis["ticker"],
+                        params=best.params,
+                        spot=spot,
+                        positions_df=pos_df,
+                        next_earnings=next_earnings,
+                    )
+            except Exception as ex:
+                st.error(f"持仓评估失败: {ex}")
+
+        if eval_key in st.session_state:
+            eval_df = st.session_state[eval_key]
+            if eval_df.empty:
+                st.info("没有解析到有效持仓，请检查CSV。")
+            else:
+                st.dataframe(
+                    eval_df.style.format(
+                        {
+                            "strike": "${:.2f}",
+                            "matched_strike": "${:.2f}",
+                            "premium_collected": "${:.2f}",
+                            "mark": "${:.2f}",
+                            "delta": "{:.2f}",
+                            "iv": "{:.2%}",
+                            "spot": "${:.2f}",
+                            "pnl_cash": "${:,.0f}",
+                            "pnl_pct": "{:.2%}",
+                            "close_trigger_mark": "${:.2f}",
+                        }
+                    ),
+                    use_container_width=True,
+                )
+                st.caption("标准止盈线：mark <= close_trigger_mark。若 Action=Roll Up & Out，按策略先滚动而不是硬扛到期。")
+
+    st.subheader("回测明细")
+    st.dataframe(
+        bt.style.format(
+            {
+                "spot": "${:.2f}",
+                "spot_expiry": "${:.2f}",
+                "vol_rank": "{:.2f}",
+                "trend_score": "{:.2f}",
+                "target_delta_effective": "{:.2f}",
+                "model_delta": "{:.2f}",
+                "strike": "${:.2f}",
+                "premium": "${:.2f}",
+                "assignment_prob_model": "{:.2%}",
+                "premium_cash": "${:,.0f}",
+                "pnl_per_share": "${:.2f}",
+                "pnl_cash": "${:,.0f}",
+                "cum_pnl_cash": "${:,.0f}",
+                "return_on_notional": "{:.2%}",
+                "premium_yield_annualized": "{:.2%}",
+                "equity": "{:.4f}",
+            }
+        ),
+        use_container_width=True,
+    )
+
+    csv = bt.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "下载回测CSV",
+        data=csv,
+        file_name=f"{analysis['ticker']}_sell_call_backtest_8y.csv",
+        mime="text/csv",
+    )
 
 
 if __name__ == "__main__":
